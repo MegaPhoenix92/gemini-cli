@@ -32,6 +32,7 @@ vi.mock('@google/gemini-cli-core', async (importOriginal) => {
   return {
     ...original,
     createTransport: vi.fn(),
+
     MCPServerStatus: {
       CONNECTED: 'CONNECTED',
       CONNECTING: 'CONNECTING',
@@ -123,8 +124,13 @@ describe('mcp list command', () => {
         ...defaultMergedSettings,
         mcpServers: {
           'stdio-server': { command: '/path/to/server', args: ['arg1'] },
-          'sse-server': { url: 'https://example.com/sse' },
+          'sse-server': { url: 'https://example.com/sse', type: 'sse' },
           'http-server': { httpUrl: 'https://example.com/http' },
+          'http-server-by-default': { url: 'https://example.com/http' },
+          'http-server-with-type': {
+            url: 'https://example.com/http',
+            type: 'http',
+          },
         },
       },
     });
@@ -148,6 +154,16 @@ describe('mcp list command', () => {
     expect(debugLogger.log).toHaveBeenCalledWith(
       expect.stringContaining(
         'http-server: https://example.com/http (http) - Connected',
+      ),
+    );
+    expect(debugLogger.log).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'http-server-by-default: https://example.com/http (http) - Connected',
+      ),
+    );
+    expect(debugLogger.log).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'http-server-with-type: https://example.com/http (http) - Connected',
       ),
     );
   });
@@ -206,6 +222,48 @@ describe('mcp list command', () => {
       expect.stringContaining(
         'extension-server (from test-extension): /ext/server  (stdio) - Connected',
       ),
+    );
+  });
+
+  it('should filter servers based on admin allowlist passed in settings', async () => {
+    const settingsWithAllowlist = mergeSettings({}, {}, {}, {}, true);
+    settingsWithAllowlist.admin = {
+      secureModeEnabled: false,
+      extensions: { enabled: true },
+      skills: { enabled: true },
+      mcp: {
+        enabled: true,
+        config: {
+          'allowed-server': { url: 'http://allowed' },
+        },
+      },
+    };
+
+    settingsWithAllowlist.mcpServers = {
+      'allowed-server': { command: 'cmd1' },
+      'forbidden-server': { command: 'cmd2' },
+    };
+
+    mockedLoadSettings.mockReturnValue({
+      merged: settingsWithAllowlist,
+    });
+
+    mockClient.connect.mockResolvedValue(undefined);
+    mockClient.ping.mockResolvedValue(undefined);
+
+    await listMcpServers(settingsWithAllowlist);
+
+    expect(debugLogger.log).toHaveBeenCalledWith(
+      expect.stringContaining('allowed-server'),
+    );
+    expect(debugLogger.log).not.toHaveBeenCalledWith(
+      expect.stringContaining('forbidden-server'),
+    );
+    expect(mockedCreateTransport).toHaveBeenCalledWith(
+      'allowed-server',
+      expect.objectContaining({ url: 'http://allowed' }), // Should use admin config
+      false,
+      expect.anything(),
     );
   });
 });

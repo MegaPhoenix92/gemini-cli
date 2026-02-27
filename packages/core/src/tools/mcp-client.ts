@@ -22,6 +22,7 @@ import type {
   Prompt,
   ReadResourceResult,
   Resource,
+  Tool as McpTool,
 } from '@modelcontextprotocol/sdk/types.js';
 import {
   ListResourcesResultSchema,
@@ -29,7 +30,8 @@ import {
   ReadResourceResultSchema,
   ResourceListChangedNotificationSchema,
   ToolListChangedNotificationSchema,
-  type Tool as McpTool,
+  PromptListChangedNotificationSchema,
+  ProgressNotificationSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { parse } from 'shell-quote';
 import type { Config, MCPServerConfig } from '../config/config.js';
@@ -37,10 +39,12 @@ import { AuthProviderType } from '../config/config.js';
 import { GoogleCredentialProvider } from '../mcp/google-auth-provider.js';
 import { ServiceAccountImpersonationProvider } from '../mcp/sa-impersonation-provider.js';
 import { DiscoveredMCPTool } from './mcp-tool.js';
+import { XcodeMcpBridgeFixTransport } from './xcode-mcp-fix-transport.js';
 
 import type { CallableTool, FunctionCall, Part, Tool } from '@google/genai';
 import { basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import type { McpAuthProvider } from '../mcp/auth-provider.js';
 import { MCPOAuthProvider } from '../mcp/oauth-provider.js';
 import { MCPOAuthTokenStorage } from '../mcp/oauth-token-storage.js';
@@ -55,6 +59,7 @@ import type {
   Unsubscribe,
   WorkspaceContext,
 } from '../utils/workspaceContext.js';
+import { getToolCallContext } from '../utils/toolCallContext.js';
 import type { ToolRegistry } from './tool-registry.js';
 import { debugLogger } from '../utils/debugLogger.js';
 import { type MessageBus } from '../confirmation-bus/message-bus.js';
@@ -64,6 +69,11 @@ import {
   sanitizeEnvironment,
   type EnvironmentSanitizationConfig,
 } from '../services/environmentSanitization.js';
+import { expandEnvVars } from '../utils/envExpansion.js';
+import {
+  GEMINI_CLI_IDENTIFICATION_ENV_VAR,
+  GEMINI_CLI_IDENTIFICATION_ENV_VAR_VALUE,
+} from '../services/shellExecutionService.js';
 
 export const MCP_DEFAULT_TIMEOUT_MSEC = 10 * 60 * 1000; // default to 10 minutes
 
@@ -99,12 +109,20 @@ export enum MCPDiscoveryState {
 }
 
 /**
+ * Interface for reporting progress from MCP tool calls.
+ */
+export interface McpProgressReporter {
+  registerProgressToken(token: string | number, callId: string): void;
+  unregisterProgressToken(token: string | number): void;
+}
+
+/**
  * A client for a single MCP server.
  *
  * This class is responsible for connecting to, discovering tools from, and
  * managing the state of a single MCP server.
  */
-export class McpClient {
+export class McpClient implements McpProgressReporter {
   private client: Client | undefined;
   private transport: Transport | undefined;
   private status: MCPServerStatus = MCPServerStatus.DISCONNECTED;
@@ -112,6 +130,14 @@ export class McpClient {
   private pendingToolRefresh: boolean = false;
   private isRefreshingResources: boolean = false;
   private pendingResourceRefresh: boolean = false;
+  private isRefreshingPrompts: boolean = false;
+  private pendingPromptRefresh: boolean = false;
+
+  /**
+   * Map of progress tokens to tool call IDs.
+   * This allows us to route progress notifications to the correct tool call.
+   */
+  private readonly progressTokenToCallId = new Map<string | number, string>();
 
   constructor(
     private readonly serverName: string,
@@ -122,6 +148,7 @@ export class McpClient {
     private readonly workspaceContext: WorkspaceContext,
     private readonly cliConfig: Config,
     private readonly debugMode: boolean,
+    private readonly clientVersion: string,
     private readonly onToolsUpdated?: (signal?: AbortSignal) => Promise<void>,
   ) {}
 
@@ -137,6 +164,7 @@ export class McpClient {
     this.updateStatus(MCPServerStatus.CONNECTING);
     try {
       this.client = await connectToMcpServer(
+        this.clientVersion,
         this.serverName,
         this.serverConfig,
         this.debugMode,
@@ -172,7 +200,7 @@ export class McpClient {
   async discover(cliConfig: Config): Promise<void> {
     this.assertConnected();
 
-    const prompts = await this.discoverPrompts();
+    const prompts = await this.fetchPrompts();
     const tools = await this.discoverTools(cliConfig);
     const resources = await this.discoverResources();
     this.updateResourceRegistry(resources);
@@ -181,6 +209,9 @@ export class McpClient {
       throw new Error('No prompts, tools, or resources found on the server.');
     }
 
+    for (const prompt of prompts) {
+      this.promptRegistry.registerPrompt(prompt);
+    }
     for (const tool of tools) {
       this.toolRegistry.registerTool(tool);
     }
@@ -240,15 +271,20 @@ export class McpClient {
       this.client!,
       cliConfig,
       this.toolRegistry.getMessageBus(),
-      options ?? {
-        timeout: this.serverConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC,
+      {
+        ...(options ?? {
+          timeout: this.serverConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC,
+        }),
+        progressReporter: this,
       },
     );
   }
 
-  private async discoverPrompts(): Promise<Prompt[]> {
+  private async fetchPrompts(options?: {
+    signal?: AbortSignal;
+  }): Promise<DiscoveredMCPPrompt[]> {
     this.assertConnected();
-    return discoverPrompts(this.serverName, this.client!, this.promptRegistry);
+    return discoverPrompts(this.serverName, this.client!, options);
   }
 
   private async discoverResources(): Promise<Resource[]> {
@@ -260,7 +296,10 @@ export class McpClient {
     this.resourceRegistry.setResourcesForServer(this.serverName, resources);
   }
 
-  async readResource(uri: string): Promise<ReadResourceResult> {
+  async readResource(
+    uri: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<ReadResourceResult> {
     this.assertConnected();
     return this.client!.request(
       {
@@ -268,6 +307,7 @@ export class McpClient {
         params: { uri },
       },
       ReadResourceResultSchema,
+      options,
     );
   }
 
@@ -313,6 +353,41 @@ export class McpClient {
         },
       );
     }
+
+    if (capabilities?.prompts?.listChanged) {
+      debugLogger.log(
+        `Server '${this.serverName}' supports prompt updates. Listening for changes...`,
+      );
+
+      this.client.setNotificationHandler(
+        PromptListChangedNotificationSchema,
+        async () => {
+          debugLogger.log(
+            `🔔 Received prompt update notification from '${this.serverName}'`,
+          );
+          await this.refreshPrompts();
+        },
+      );
+    }
+
+    this.client.setNotificationHandler(
+      ProgressNotificationSchema,
+      (notification) => {
+        const { progressToken, progress, total, message } = notification.params;
+        const callId = this.progressTokenToCallId.get(progressToken);
+
+        if (callId) {
+          coreEvents.emitMcpProgress({
+            serverName: this.serverName,
+            callId,
+            progressToken,
+            progress,
+            total,
+            message,
+          });
+        }
+      },
+    );
   }
 
   /**
@@ -370,6 +445,77 @@ export class McpClient {
     } finally {
       this.isRefreshingResources = false;
       this.pendingResourceRefresh = false;
+    }
+  }
+
+  /**
+   * Registers a progress token for a tool call.
+   */
+  registerProgressToken(token: string | number, callId: string): void {
+    this.progressTokenToCallId.set(token, callId);
+  }
+
+  /**
+   * Unregisters a progress token.
+   */
+  unregisterProgressToken(token: string | number): void {
+    this.progressTokenToCallId.delete(token);
+  }
+
+  /**
+   * Refreshes prompts for this server by re-querying the MCP `prompts/list` endpoint.
+   */
+  private async refreshPrompts(): Promise<void> {
+    if (this.isRefreshingPrompts) {
+      debugLogger.log(
+        `Prompt refresh for '${this.serverName}' is already in progress. Pending update.`,
+      );
+      this.pendingPromptRefresh = true;
+      return;
+    }
+
+    this.isRefreshingPrompts = true;
+
+    try {
+      do {
+        this.pendingPromptRefresh = false;
+
+        if (this.status !== MCPServerStatus.CONNECTED || !this.client) break;
+
+        const timeoutMs = this.serverConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC;
+        const abortController = new AbortController();
+        const timeoutId = setTimeout(() => abortController.abort(), timeoutMs);
+
+        try {
+          const newPrompts = await this.fetchPrompts({
+            signal: abortController.signal,
+          });
+          this.promptRegistry.removePromptsByServer(this.serverName);
+          for (const prompt of newPrompts) {
+            this.promptRegistry.registerPrompt(prompt);
+          }
+        } catch (err) {
+          debugLogger.error(
+            `Prompt discovery failed during refresh: ${getErrorMessage(err)}`,
+          );
+          clearTimeout(timeoutId);
+          break;
+        }
+
+        clearTimeout(timeoutId);
+
+        coreEvents.emitFeedback(
+          'info',
+          `Prompts updated for server: ${this.serverName}`,
+        );
+      } while (this.pendingPromptRefresh);
+    } catch (error) {
+      debugLogger.error(
+        `Critical error in prompt refresh loop for ${this.serverName}: ${getErrorMessage(error)}`,
+      );
+    } finally {
+      this.isRefreshingPrompts = false;
+      this.pendingPromptRefresh = false;
     }
   }
 
@@ -573,18 +719,17 @@ async function handleAutomaticOAuth(
   try {
     debugLogger.log(`🔐 '${mcpServerName}' requires OAuth authentication`);
 
-    // Always try to parse the resource metadata URI from the www-authenticate header
-    let oauthConfig;
-    const resourceMetadataUri =
-      OAuthUtils.parseWWWAuthenticateHeader(wwwAuthenticate);
-    if (resourceMetadataUri) {
-      oauthConfig = await OAuthUtils.discoverOAuthConfig(resourceMetadataUri);
-    } else if (hasNetworkTransport(mcpServerConfig)) {
+    const serverUrl = mcpServerConfig.httpUrl || mcpServerConfig.url;
+
+    // Try to discover OAuth config from the WWW-Authenticate header first
+    let oauthConfig = await OAuthUtils.discoverOAuthFromWWWAuthenticate(
+      wwwAuthenticate,
+      serverUrl,
+    );
+
+    if (!oauthConfig && hasNetworkTransport(mcpServerConfig)) {
       // Fallback: try to discover OAuth config from the base URL
-      const serverUrl = new URL(
-        mcpServerConfig.httpUrl || mcpServerConfig.url!,
-      );
-      const baseUrl = `${serverUrl.protocol}//${serverUrl.host}`;
+      const baseUrl = OAuthUtils.extractBaseUrl(serverUrl!);
       oauthConfig = await OAuthUtils.discoverOAuthConfig(baseUrl);
     }
 
@@ -602,13 +747,12 @@ async function handleAutomaticOAuth(
     const oauthAuthConfig = {
       enabled: true,
       authorizationUrl: oauthConfig.authorizationUrl,
+      issuer: oauthConfig.issuer,
       tokenUrl: oauthConfig.tokenUrl,
       scopes: oauthConfig.scopes || [],
     };
 
     // Perform OAuth authentication
-    // Pass the server URL for proper discovery
-    const serverUrl = mcpServerConfig.httpUrl || mcpServerConfig.url;
     debugLogger.log(
       `Starting OAuth authentication for server '${mcpServerName}'...`,
     );
@@ -639,9 +783,16 @@ function createTransportRequestInit(
   mcpServerConfig: MCPServerConfig,
   headers: Record<string, string>,
 ): RequestInit {
+  const expandedHeaders: Record<string, string> = {};
+  if (mcpServerConfig.headers) {
+    for (const [key, value] of Object.entries(mcpServerConfig.headers)) {
+      expandedHeaders[key] = expandEnvVars(value, process.env);
+    }
+  }
+
   return {
     headers: {
-      ...mcpServerConfig.headers,
+      ...expandedHeaders,
       ...headers,
     },
   };
@@ -715,6 +866,7 @@ async function createTransportWithOAuth(
  */
 
 export async function discoverMcpTools(
+  clientVersion: string,
   mcpServers: Record<string, MCPServerConfig>,
   mcpServerCommand: string | undefined,
   toolRegistry: ToolRegistry,
@@ -730,6 +882,7 @@ export async function discoverMcpTools(
     const discoveryPromises = Object.entries(mcpServers).map(
       ([mcpServerName, mcpServerConfig]) =>
         connectAndDiscover(
+          clientVersion,
           mcpServerName,
           mcpServerConfig,
           toolRegistry,
@@ -770,6 +923,7 @@ class LenientJsonSchemaValidator implements jsonSchemaValidator {
       );
       return (input: unknown) => ({
         valid: true as const,
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
         data: input as T,
         errorMessage: undefined,
       });
@@ -784,6 +938,7 @@ export function populateMcpServerCommand(
 ): Record<string, MCPServerConfig> {
   if (mcpServerCommand) {
     const cmd = mcpServerCommand;
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
     const args = parse(cmd, process.env) as string[];
     if (args.some((arg) => typeof arg !== 'string')) {
       throw new Error('failed to parse mcpServerCommand: ' + cmd);
@@ -808,6 +963,7 @@ export function populateMcpServerCommand(
  * @returns Promise that resolves when discovery is complete
  */
 export async function connectAndDiscover(
+  clientVersion: string,
   mcpServerName: string,
   mcpServerConfig: MCPServerConfig,
   toolRegistry: ToolRegistry,
@@ -821,6 +977,7 @@ export async function connectAndDiscover(
   let mcpClient: Client | undefined;
   try {
     mcpClient = await connectToMcpServer(
+      clientVersion,
       mcpServerName,
       mcpServerConfig,
       debugMode,
@@ -834,11 +991,7 @@ export async function connectAndDiscover(
     };
 
     // Attempt to discover both prompts and tools
-    const prompts = await discoverPrompts(
-      mcpServerName,
-      mcpClient,
-      promptRegistry,
-    );
+    const prompts = await discoverPrompts(mcpServerName, mcpClient);
     const tools = await discoverTools(
       mcpServerName,
       mcpServerConfig,
@@ -856,7 +1009,10 @@ export async function connectAndDiscover(
     // If we found anything, the server is connected
     updateMCPServerStatus(mcpServerName, MCPServerStatus.CONNECTED);
 
-    // Register any discovered tools
+    // Register any discovered prompts and tools
+    for (const prompt of prompts) {
+      promptRegistry.registerPrompt(prompt);
+    }
     for (const tool of tools) {
       toolRegistry.registerTool(tool);
     }
@@ -896,7 +1052,11 @@ export async function discoverTools(
   mcpClient: Client,
   cliConfig: Config,
   messageBus: MessageBus,
-  options?: { timeout?: number; signal?: AbortSignal },
+  options?: {
+    timeout?: number;
+    signal?: AbortSignal;
+    progressReporter?: McpProgressReporter;
+  },
 ): Promise<DiscoveredMCPTool[]> {
   try {
     // Only request tools if the server supports them.
@@ -914,7 +1074,12 @@ export async function discoverTools(
           mcpClient,
           toolDef,
           mcpServerConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC,
+          options?.progressReporter,
         );
+
+        // Extract annotations from the tool definition
+        const annotations = toolDef.annotations;
+        const isReadOnly = annotations?.readOnlyHint === true;
 
         const tool = new DiscoveredMCPTool(
           mcpCallableTool,
@@ -924,10 +1089,12 @@ export async function discoverTools(
           toolDef.inputSchema ?? { type: 'object', properties: {} },
           messageBus,
           mcpServerConfig.trust,
+          isReadOnly,
           undefined,
           cliConfig,
           mcpServerConfig.extension?.name,
           mcpServerConfig.extension?.id,
+          annotations as Record<string, unknown> | undefined,
         );
 
         discoveredTools.push(tool);
@@ -936,6 +1103,7 @@ export async function discoverTools(
           'error',
           `Error discovering tool: '${
             toolDef.name
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
           }' from MCP server '${mcpServerName}': ${(error as Error).message}`,
           error,
         );
@@ -964,6 +1132,7 @@ class McpCallableTool implements CallableTool {
     private readonly client: Client,
     private readonly toolDef: McpTool,
     private readonly timeout: number,
+    private readonly progressReporter?: McpProgressReporter,
   ) {}
 
   async tool(): Promise<Tool> {
@@ -985,11 +1154,22 @@ class McpCallableTool implements CallableTool {
     }
     const call = functionCalls[0];
 
+    const progressToken = randomUUID();
+    const context = getToolCallContext();
+    if (context && this.progressReporter) {
+      this.progressReporter.registerProgressToken(
+        progressToken,
+        context.callId,
+      );
+    }
+
     try {
       const result = await this.client.callTool(
         {
           name: call.name!,
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
           arguments: call.args as Record<string, unknown>,
+          _meta: { progressToken },
         },
         undefined,
         { timeout: this.timeout },
@@ -1018,6 +1198,10 @@ class McpCallableTool implements CallableTool {
           },
         },
       ];
+    } finally {
+      if (this.progressReporter) {
+        this.progressReporter.unregisterProgressToken(progressToken);
+      }
     }
   }
 }
@@ -1032,39 +1216,32 @@ class McpCallableTool implements CallableTool {
 export async function discoverPrompts(
   mcpServerName: string,
   mcpClient: Client,
-  promptRegistry: PromptRegistry,
-): Promise<Prompt[]> {
+  options?: { signal?: AbortSignal },
+): Promise<DiscoveredMCPPrompt[]> {
+  // Only request prompts if the server supports them.
+  if (mcpClient.getServerCapabilities()?.prompts == null) return [];
+
   try {
-    // Only request prompts if the server supports them.
-    if (mcpClient.getServerCapabilities()?.prompts == null) return [];
-
-    const response = await mcpClient.listPrompts({});
-
-    for (const prompt of response.prompts) {
-      promptRegistry.registerPrompt({
-        ...prompt,
-        serverName: mcpServerName,
-        invoke: (params: Record<string, unknown>) =>
-          invokeMcpPrompt(mcpServerName, mcpClient, prompt.name, params),
-      });
-    }
-    return response.prompts;
+    const response = await mcpClient.listPrompts({}, options);
+    return response.prompts.map((prompt) => ({
+      ...prompt,
+      serverName: mcpServerName,
+      invoke: (params: Record<string, unknown>) =>
+        invokeMcpPrompt(mcpServerName, mcpClient, prompt.name, params),
+    }));
   } catch (error) {
-    // It's okay if this fails, not all servers will have prompts.
-    // Don't log an error if the method is not found, which is a common case.
-    if (
-      error instanceof Error &&
-      !error.message?.includes('Method not found')
-    ) {
-      coreEvents.emitFeedback(
-        'error',
-        `Error discovering prompts from ${mcpServerName}: ${getErrorMessage(
-          error,
-        )}`,
-        error,
-      );
+    // It's okay if the method is not found, which is a common case.
+    if (error instanceof Error && error.message?.includes('Method not found')) {
+      return [];
     }
-    return [];
+    coreEvents.emitFeedback(
+      'error',
+      `Error discovering prompts from ${mcpServerName}: ${getErrorMessage(
+        error,
+      )}`,
+      error,
+    );
+    throw error;
   }
 }
 
@@ -1331,6 +1508,7 @@ async function retryWithOAuth(
  * @throws An error if the connection fails or the configuration is invalid.
  */
 export async function connectToMcpServer(
+  clientVersion: string,
   mcpServerName: string,
   mcpServerConfig: MCPServerConfig,
   debugMode: boolean,
@@ -1340,7 +1518,7 @@ export async function connectToMcpServer(
   const mcpClient = new Client(
     {
       name: 'gemini-cli-mcp-client',
-      version: '0.0.1',
+      version: clientVersion,
     },
     {
       // Use a tolerant validator so bad output schemas don't block discovery.
@@ -1411,6 +1589,7 @@ export async function connectToMcpServer(
       return mcpClient;
     } catch (error) {
       await transport.close();
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
       firstAttemptError = error as Error;
       throw error;
     }
@@ -1450,6 +1629,7 @@ export async function connectToMcpServer(
         );
         return mcpClient;
       } catch (sseFallbackError) {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
         sseError = sseFallbackError as Error;
 
         // If SSE also returned 401, handle OAuth below
@@ -1599,6 +1779,7 @@ export async function connectToMcpServer(
             const oauthAuthConfig = {
               enabled: true,
               authorizationUrl: oauthConfig.authorizationUrl,
+              issuer: oauthConfig.issuer,
               tokenUrl: oauthConfig.tokenUrl,
               scopes: oauthConfig.scopes || [],
             };
@@ -1787,24 +1968,70 @@ export async function createTransport(
   }
 
   if (mcpServerConfig.command) {
-    const transport = new StdioClientTransport({
+    // 1. Sanitize the base process environment to prevent unintended leaks of system-wide secrets.
+    const sanitizedEnv = sanitizeEnvironment(process.env, {
+      ...sanitizationConfig,
+      enableEnvironmentVariableRedaction: true,
+    });
+
+    const finalEnv: Record<string, string> = {
+      [GEMINI_CLI_IDENTIFICATION_ENV_VAR]:
+        GEMINI_CLI_IDENTIFICATION_ENV_VAR_VALUE,
+    };
+    for (const [key, value] of Object.entries(sanitizedEnv)) {
+      if (value !== undefined) {
+        finalEnv[key] = value;
+      }
+    }
+
+    // Expand and merge explicit environment variables from the MCP configuration.
+    if (mcpServerConfig.env) {
+      for (const [key, value] of Object.entries(mcpServerConfig.env)) {
+        finalEnv[key] = expandEnvVars(value, process.env);
+      }
+    }
+
+    let transport: Transport = new StdioClientTransport({
       command: mcpServerConfig.command,
       args: mcpServerConfig.args || [],
-      env: {
-        ...sanitizeEnvironment(process.env, sanitizationConfig),
-        ...(mcpServerConfig.env || {}),
-      } as Record<string, string>,
+      env: finalEnv,
       cwd: mcpServerConfig.cwd,
       stderr: 'pipe',
     });
+
+    // Fix for Xcode 26.3 mcpbridge non-compliant responses
+    // It returns JSON in `content` instead of `structuredContent`
+    if (
+      mcpServerConfig.command === 'xcrun' &&
+      mcpServerConfig.args?.includes('mcpbridge')
+    ) {
+      transport = new XcodeMcpBridgeFixTransport(transport);
+    }
+
     if (debugMode) {
-      transport.stderr!.on('data', (data) => {
-        const stderrStr = data.toString().trim();
-        debugLogger.debug(
-          `[DEBUG] [MCP STDERR (${mcpServerName})]: `,
-          stderrStr,
-        );
-      });
+      // The `XcodeMcpBridgeFixTransport` wrapper hides the underlying `StdioClientTransport`,
+      // which exposes `stderr` for debug logging. We need to unwrap it to attach the listener.
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      const underlyingTransport =
+        transport instanceof XcodeMcpBridgeFixTransport
+          ? // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-type-assertion
+            (transport as any).transport
+          : transport;
+
+      if (
+        underlyingTransport instanceof StdioClientTransport &&
+        underlyingTransport.stderr
+      ) {
+        underlyingTransport.stderr.on('data', (data) => {
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+          const stderrStr = data.toString().trim();
+          debugLogger.debug(
+            `[DEBUG] [MCP STDERR (${mcpServerName})]: `,
+            stderrStr,
+          );
+        });
+      }
     }
     return transport;
   }

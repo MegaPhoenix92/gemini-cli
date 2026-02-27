@@ -25,6 +25,7 @@ import {
   KeychainTokenStorage,
   loadAgentsFromDirectory,
   loadSkillsFromDir,
+  getRealPath,
 } from '@google/gemini-cli-core';
 import {
   loadSettings,
@@ -186,11 +187,11 @@ describe('extension tests', () => {
       errors: [],
     });
     vi.mocked(loadSkillsFromDir).mockResolvedValue([]);
-    tempHomeDir = fs.mkdtempSync(
-      path.join(os.tmpdir(), 'gemini-cli-test-home-'),
+    tempHomeDir = getRealPath(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-cli-test-home-')),
     );
-    tempWorkspaceDir = fs.mkdtempSync(
-      path.join(tempHomeDir, 'gemini-cli-test-workspace-'),
+    tempWorkspaceDir = getRealPath(
+      fs.mkdtempSync(path.join(tempHomeDir, 'gemini-cli-test-workspace-')),
     );
     userExtensionsDir = path.join(tempHomeDir, EXTENSIONS_DIRECTORY_NAME);
     mockRequestConsent = vi.fn();
@@ -329,12 +330,14 @@ describe('extension tests', () => {
     });
 
     it('should load a linked extension correctly', async () => {
-      const sourceExtDir = createExtension({
-        extensionsDir: tempWorkspaceDir,
-        name: 'my-linked-extension',
-        version: '1.0.0',
-        contextFileName: 'context.md',
-      });
+      const sourceExtDir = getRealPath(
+        createExtension({
+          extensionsDir: tempWorkspaceDir,
+          name: 'my-linked-extension',
+          version: '1.0.0',
+          contextFileName: 'context.md',
+        }),
+      );
       fs.writeFileSync(path.join(sourceExtDir, 'context.md'), 'linked context');
 
       await extensionManager.loadExtensions();
@@ -361,18 +364,20 @@ describe('extension tests', () => {
     });
 
     it('should hydrate ${extensionPath} correctly for linked extensions', async () => {
-      const sourceExtDir = createExtension({
-        extensionsDir: tempWorkspaceDir,
-        name: 'my-linked-extension-with-path',
-        version: '1.0.0',
-        mcpServers: {
-          'test-server': {
-            command: 'node',
-            args: ['${extensionPath}${/}server${/}index.js'],
-            cwd: '${extensionPath}${/}server',
+      const sourceExtDir = getRealPath(
+        createExtension({
+          extensionsDir: tempWorkspaceDir,
+          name: 'my-linked-extension-with-path',
+          version: '1.0.0',
+          mcpServers: {
+            'test-server': {
+              command: 'node',
+              args: ['${extensionPath}${/}server${/}index.js'],
+              cwd: '${extensionPath}${/}server',
+            },
           },
-        },
-      });
+        }),
+      );
 
       await extensionManager.loadExtensions();
       await extensionManager.installOrUpdateExtension({
@@ -622,6 +627,7 @@ describe('extension tests', () => {
     });
 
     it('should not load github extensions if blockGitExtensions is set', async () => {
+      const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
       createExtension({
         extensionsDir: userExtensionsDir,
         name: 'my-ext',
@@ -645,6 +651,73 @@ describe('extension tests', () => {
       const extension = extensions.find((e) => e.name === 'my-ext');
 
       expect(extension).toBeUndefined();
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'Extensions from remote sources is disallowed by your current settings.',
+        ),
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it('should load allowed extensions if the allowlist is set.', async () => {
+      createExtension({
+        extensionsDir: userExtensionsDir,
+        name: 'my-ext',
+        version: '1.0.0',
+        installMetadata: {
+          type: 'git',
+          source: 'http://allowed.com/foo/bar',
+        },
+      });
+      const extensionAllowlistSetting = createTestMergedSettings({
+        security: {
+          allowedExtensions: ['\\b(https?:\\/\\/)?(www\\.)?allowed\\.com\\S*'],
+        },
+      });
+      extensionManager = new ExtensionManager({
+        workspaceDir: tempWorkspaceDir,
+        requestConsent: mockRequestConsent,
+        requestSetting: mockPromptForSettings,
+        settings: extensionAllowlistSetting,
+      });
+      const extensions = await extensionManager.loadExtensions();
+
+      expect(extensions).toHaveLength(1);
+      expect(extensions[0].name).toBe('my-ext');
+    });
+
+    it('should not load disallowed extensions if the allowlist is set.', async () => {
+      const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      createExtension({
+        extensionsDir: userExtensionsDir,
+        name: 'my-ext',
+        version: '1.0.0',
+        installMetadata: {
+          type: 'git',
+          source: 'http://notallowed.com/foo/bar',
+        },
+      });
+      const extensionAllowlistSetting = createTestMergedSettings({
+        security: {
+          allowedExtensions: ['\\b(https?:\\/\\/)?(www\\.)?allowed\\.com\\S*'],
+        },
+      });
+      extensionManager = new ExtensionManager({
+        workspaceDir: tempWorkspaceDir,
+        requestConsent: mockRequestConsent,
+        requestSetting: mockPromptForSettings,
+        settings: extensionAllowlistSetting,
+      });
+      const extensions = await extensionManager.loadExtensions();
+      const extension = extensions.find((e) => e.name === 'my-ext');
+
+      expect(extension).toBeUndefined();
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'This extension is not allowed by the "allowedExtensions" security setting',
+        ),
+      );
+      consoleSpy.mockRestore();
     });
 
     it('should not load any extensions if admin.extensions.enabled is false', async () => {
@@ -776,11 +849,13 @@ describe('extension tests', () => {
 
       it('should generate id from the original source for linked extensions', async () => {
         const extDevelopmentDir = path.join(tempHomeDir, 'local_extensions');
-        const actualExtensionDir = createExtension({
-          extensionsDir: extDevelopmentDir,
-          name: 'link-ext-name',
-          version: '1.0.0',
-        });
+        const actualExtensionDir = getRealPath(
+          createExtension({
+            extensionsDir: extDevelopmentDir,
+            name: 'link-ext-name',
+            version: '1.0.0',
+          }),
+        );
         await extensionManager.loadExtensions();
         await extensionManager.installOrUpdateExtension({
           type: 'link',
@@ -815,6 +890,7 @@ describe('extension tests', () => {
         fs.mkdirSync(hooksDir);
 
         const hooksConfig = {
+          enabled: false,
           hooks: {
             BeforeTool: [
               {
@@ -836,7 +912,7 @@ describe('extension tests', () => {
         );
 
         const settings = loadSettings(tempWorkspaceDir).merged;
-        settings.hooks.enabled = true;
+        settings.hooksConfig.enabled = true;
 
         extensionManager = new ExtensionManager({
           workspaceDir: tempWorkspaceDir,
@@ -867,11 +943,11 @@ describe('extension tests', () => {
         fs.mkdirSync(hooksDir);
         fs.writeFileSync(
           path.join(hooksDir, 'hooks.json'),
-          JSON.stringify({ hooks: { BeforeTool: [] } }),
+          JSON.stringify({ hooks: { BeforeTool: [] }, enabled: false }),
         );
 
         const settings = loadSettings(tempWorkspaceDir).merged;
-        settings.hooks.enabled = false;
+        settings.hooksConfig.enabled = false;
 
         extensionManager = new ExtensionManager({
           workspaceDir: tempWorkspaceDir,
@@ -925,11 +1001,13 @@ describe('extension tests', () => {
 
   describe('installExtension', () => {
     it('should install an extension from a local path', async () => {
-      const sourceExtDir = createExtension({
-        extensionsDir: tempHomeDir,
-        name: 'my-local-extension',
-        version: '1.0.0',
-      });
+      const sourceExtDir = getRealPath(
+        createExtension({
+          extensionsDir: tempHomeDir,
+          name: 'my-local-extension',
+          version: '1.0.0',
+        }),
+      );
       const targetExtDir = path.join(userExtensionsDir, 'my-local-extension');
       const metadataPath = path.join(targetExtDir, INSTALL_METADATA_FILENAME);
 
@@ -971,7 +1049,7 @@ describe('extension tests', () => {
     });
 
     it('should throw an error and cleanup if gemini-extension.json is missing', async () => {
-      const sourceExtDir = path.join(tempHomeDir, 'bad-extension');
+      const sourceExtDir = getRealPath(path.join(tempHomeDir, 'bad-extension'));
       fs.mkdirSync(sourceExtDir, { recursive: true });
       const configPath = path.join(sourceExtDir, EXTENSIONS_CONFIG_FILENAME);
 
@@ -987,7 +1065,7 @@ describe('extension tests', () => {
     });
 
     it('should throw an error for invalid JSON in gemini-extension.json', async () => {
-      const sourceExtDir = path.join(tempHomeDir, 'bad-json-ext');
+      const sourceExtDir = getRealPath(path.join(tempHomeDir, 'bad-json-ext'));
       fs.mkdirSync(sourceExtDir, { recursive: true });
       const configPath = path.join(sourceExtDir, EXTENSIONS_CONFIG_FILENAME);
       fs.writeFileSync(configPath, '{ "name": "bad-json", "version": "1.0.0"'); // Malformed JSON
@@ -997,22 +1075,17 @@ describe('extension tests', () => {
           source: sourceExtDir,
           type: 'local',
         }),
-      ).rejects.toThrow(
-        new RegExp(
-          `^Failed to load extension config from ${configPath.replace(
-            /\\/g,
-            '\\\\',
-          )}`,
-        ),
-      );
+      ).rejects.toThrow(`Failed to load extension config from ${configPath}`);
     });
 
     it('should throw an error for missing name in gemini-extension.json', async () => {
-      const sourceExtDir = createExtension({
-        extensionsDir: tempHomeDir,
-        name: 'missing-name-ext',
-        version: '1.0.0',
-      });
+      const sourceExtDir = getRealPath(
+        createExtension({
+          extensionsDir: tempHomeDir,
+          name: 'missing-name-ext',
+          version: '1.0.0',
+        }),
+      );
       const configPath = path.join(sourceExtDir, EXTENSIONS_CONFIG_FILENAME);
       // Overwrite with invalid config
       fs.writeFileSync(configPath, JSON.stringify({ version: '1.0.0' }));
@@ -1065,11 +1138,13 @@ describe('extension tests', () => {
     });
 
     it('should install a linked extension', async () => {
-      const sourceExtDir = createExtension({
-        extensionsDir: tempHomeDir,
-        name: 'my-linked-extension',
-        version: '1.0.0',
-      });
+      const sourceExtDir = getRealPath(
+        createExtension({
+          extensionsDir: tempHomeDir,
+          name: 'my-linked-extension',
+          version: '1.0.0',
+        }),
+      );
       const targetExtDir = path.join(userExtensionsDir, 'my-linked-extension');
       const metadataPath = path.join(targetExtDir, INSTALL_METADATA_FILENAME);
       const configPath = path.join(targetExtDir, EXTENSIONS_CONFIG_FILENAME);
@@ -1112,6 +1187,30 @@ describe('extension tests', () => {
         }),
       ).rejects.toThrow(
         'Installing extensions from remote sources is disallowed by your current settings.',
+      );
+    });
+
+    it('should not install a disallowed extension if the allowlist is set', async () => {
+      const gitUrl = 'https://somehost.com/somerepo.git';
+      const allowedExtensionsSetting = createTestMergedSettings({
+        security: {
+          allowedExtensions: ['\\b(https?:\\/\\/)?(www\\.)?allowed\\.com\\S*'],
+        },
+      });
+      extensionManager = new ExtensionManager({
+        workspaceDir: tempWorkspaceDir,
+        requestConsent: mockRequestConsent,
+        requestSetting: mockPromptForSettings,
+        settings: allowedExtensionsSetting,
+      });
+      await extensionManager.loadExtensions();
+      await expect(
+        extensionManager.installOrUpdateExtension({
+          source: gitUrl,
+          type: 'git',
+        }),
+      ).rejects.toThrow(
+        `Installing extension from source "${gitUrl}" is not allowed by the "allowedExtensions" security setting.`,
       );
     });
 
@@ -1346,11 +1445,13 @@ ${INSTALL_WARNING_MESSAGE}`,
     });
 
     it('should save the autoUpdate flag to the install metadata', async () => {
-      const sourceExtDir = createExtension({
-        extensionsDir: tempHomeDir,
-        name: 'my-local-extension',
-        version: '1.0.0',
-      });
+      const sourceExtDir = getRealPath(
+        createExtension({
+          extensionsDir: tempHomeDir,
+          name: 'my-local-extension',
+          version: '1.0.0',
+        }),
+      );
       const targetExtDir = path.join(userExtensionsDir, 'my-local-extension');
       const metadataPath = path.join(targetExtDir, INSTALL_METADATA_FILENAME);
 
