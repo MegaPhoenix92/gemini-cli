@@ -39,7 +39,8 @@ google-gemini/gemini-cli  →  gemini-cli  →  phoenix_cli
 2. **DO NOT add TROZLAN-specific code here** - That belongs in phoenix_cli
 3. **This repo auto-syncs with Google** - Any custom code will cause merge
    conflicts
-4. **Cherry-pick TO phoenix_cli** - Never merge phoenix_cli back here
+4. **Merge TO phoenix_cli** - Phoenix CLI shares git history; use `git merge`
+   from gemini-staging remote. Never merge phoenix_cli back here
 
 ### When to Use Each Repo
 
@@ -76,8 +77,8 @@ tmux attach -t gemini-dev
 
 | Property        | Value                                 |
 | --------------- | ------------------------------------- |
-| **Version**     | `0.26.0-nightly.20260115.6cb3ae4e0`   |
-| **Model**       | `gemini-3-flash-preview` (Auto)       |
+| **Version**     | `0.30.0-nightly.20260210.a2174751d`   |
+| **Model**       | `gemini-2.5-flash` (Auto)             |
 | **API Key**     | `...BwM` (separate quota from global) |
 | **MCP Servers** | 1 connected                           |
 | **Skills**      | 1 loaded                              |
