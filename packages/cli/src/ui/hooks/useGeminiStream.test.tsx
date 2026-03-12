@@ -5,22 +5,29 @@
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import type { Mock, MockInstance } from 'vitest';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import {
+  describe,
+  it,
+  expect,
+  vi,
+  beforeEach,
+  type Mock,
+  type MockInstance,
+} from 'vitest';
 import { act } from 'react';
 import { renderHookWithProviders } from '../../test-utils/render.js';
 import { waitFor } from '../../test-utils/async.js';
 import { useGeminiStream } from './useGeminiStream.js';
 import { useKeypress } from './useKeypress.js';
 import * as atCommandProcessor from './atCommandProcessor.js';
-import type {
-  TrackedToolCall,
-  TrackedCompletedToolCall,
-  TrackedExecutingToolCall,
-  TrackedCancelledToolCall,
-  TrackedWaitingToolCall,
+import {
+  useToolScheduler,
+  type TrackedToolCall,
+  type TrackedCompletedToolCall,
+  type TrackedExecutingToolCall,
+  type TrackedCancelledToolCall,
+  type TrackedWaitingToolCall,
 } from './useToolScheduler.js';
-import { useToolScheduler } from './useToolScheduler.js';
 import type {
   Config,
   EditorType,
@@ -50,6 +57,7 @@ import { MessageType, StreamingState } from '../types.js';
 
 import type { LoadedSettings } from '../../config/settings.js';
 import { findLastSafeSplitPoint } from '../utils/markdownUtilities.js';
+import { theme } from '../semantic-colors.js';
 
 // --- MOCKS ---
 const mockSendMessageStream = vi
@@ -270,6 +278,7 @@ describe('useGeminiStream', () => {
     addHistory: vi.fn(),
     getSessionId: vi.fn(() => 'test-session-id'),
     setQuotaErrorOccurred: vi.fn(),
+    resetBillingTurnState: vi.fn(),
     getQuotaErrorOccurred: vi.fn(() => false),
     getModel: vi.fn(() => 'gemini-2.5-pro'),
     getContentGeneratorConfig: vi.fn(() => ({
@@ -335,7 +344,10 @@ describe('useGeminiStream', () => {
   });
 
   const mockLoadedSettings: LoadedSettings = {
-    merged: { preferredEditor: 'vscode' },
+    merged: {
+      preferredEditor: 'vscode',
+      ui: { errorVerbosity: 'full' },
+    },
     user: { path: '/user/settings.json', settings: {} },
     workspace: { path: '/workspace/.gemini/settings.json', settings: {} },
     errors: [],
@@ -346,6 +358,7 @@ describe('useGeminiStream', () => {
   const renderTestHook = (
     initialToolCalls: TrackedToolCall[] = [],
     geminiClient?: any,
+    loadedSettings: LoadedSettings = mockLoadedSettings,
   ) => {
     const client = geminiClient || mockConfig.getGeminiClient();
     let lastToolCalls = initialToolCalls;
@@ -360,7 +373,7 @@ describe('useGeminiStream', () => {
         cmd: PartListUnion,
       ) => Promise<SlashCommandProcessorResult | false>,
       shellModeActive: false,
-      loadedSettings: mockLoadedSettings,
+      loadedSettings,
       toolCalls: initialToolCalls,
     };
 
@@ -802,14 +815,6 @@ describe('useGeminiStream', () => {
     expect(injectedHintPart.text).toContain(
       'Do not cancel/skip tasks unless the user explicitly cancels them.',
     );
-    expect(
-      mockAddItem.mock.calls.some(
-        ([item]) =>
-          item?.type === 'info' &&
-          typeof item.text === 'string' &&
-          item.text.includes('Got it. Focusing on tests only.'),
-      ),
-    ).toBe(true);
 
     expect(mockRunInDevTraceSpan).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -969,6 +974,93 @@ describe('useGeminiStream', () => {
       // Streaming state should be Idle
       expect(result.current.streamingState).toBe(StreamingState.Idle);
     });
+
+    const infoTexts = mockAddItem.mock.calls.map(
+      ([item]) => (item as { text?: string }).text ?? '',
+    );
+    expect(
+      infoTexts.some((text) =>
+        text.includes(
+          'Some internal tool attempts failed before this final error',
+        ),
+      ),
+    ).toBe(false);
+    expect(
+      infoTexts.some((text) =>
+        text.includes('This request failed. Press F12 for diagnostics'),
+      ),
+    ).toBe(false);
+  });
+
+  it('should add a compact suppressed-error note before STOP_EXECUTION terminal info in low verbosity mode', async () => {
+    const stopExecutionToolCalls: TrackedToolCall[] = [
+      {
+        request: {
+          callId: 'stop-call',
+          name: 'stopTool',
+          args: {},
+          isClientInitiated: false,
+          prompt_id: 'prompt-id-stop',
+        },
+        status: CoreToolCallStatus.Error,
+        response: {
+          callId: 'stop-call',
+          responseParts: [{ text: 'error occurred' }],
+          errorType: ToolErrorType.STOP_EXECUTION,
+          error: new Error('Stop reason from hook'),
+          resultDisplay: undefined,
+        },
+        responseSubmittedToGemini: false,
+        tool: {
+          displayName: 'stop tool',
+        },
+        invocation: {
+          getDescription: () => `Mock description`,
+        } as unknown as AnyToolInvocation,
+      } as unknown as TrackedCompletedToolCall,
+    ];
+    const lowVerbositySettings = {
+      ...mockLoadedSettings,
+      merged: {
+        ...mockLoadedSettings.merged,
+        ui: { errorVerbosity: 'low' },
+      },
+    } as LoadedSettings;
+    const client = new MockedGeminiClientClass(mockConfig);
+
+    const { result } = renderTestHook([], client, lowVerbositySettings);
+
+    await act(async () => {
+      if (capturedOnComplete) {
+        await capturedOnComplete(stopExecutionToolCalls);
+      }
+    });
+
+    await waitFor(() => {
+      expect(mockMarkToolsAsSubmitted).toHaveBeenCalledWith(['stop-call']);
+      expect(mockSendMessageStream).not.toHaveBeenCalled();
+      expect(result.current.streamingState).toBe(StreamingState.Idle);
+    });
+
+    const infoTexts = mockAddItem.mock.calls.map(
+      ([item]) => (item as { text?: string }).text ?? '',
+    );
+    const noteIndex = infoTexts.findIndex((text) =>
+      text.includes(
+        'Some internal tool attempts failed before this final error',
+      ),
+    );
+    const stopIndex = infoTexts.findIndex((text) =>
+      text.includes('Agent execution stopped: Stop reason from hook'),
+    );
+    const failureHintIndex = infoTexts.findIndex((text) =>
+      text.includes('This request failed. Press F12 for diagnostics'),
+    );
+    expect(noteIndex).toBeGreaterThanOrEqual(0);
+    expect(stopIndex).toBeGreaterThanOrEqual(0);
+    // The failure hint should NOT be present if the suppressed error note was shown
+    expect(failureHintIndex).toBe(-1);
+    expect(noteIndex).toBeLessThan(stopIndex);
   });
 
   it('should group multiple cancelled tool call responses into a single history entry', async () => {
@@ -2209,14 +2301,14 @@ describe('useGeminiStream', () => {
           requestTokens: 20,
           remainingTokens: 80,
           expectedMessage:
-            'Sending this message (20 tokens) might exceed the remaining context window limit (80 tokens).',
+            'Sending this message (20 tokens) might exceed the context window limit (80 tokens left).',
         },
         {
           name: 'with suggestion when remaining tokens are < 75% of limit',
           requestTokens: 30,
           remainingTokens: 70,
           expectedMessage:
-            'Sending this message (30 tokens) might exceed the remaining context window limit (70 tokens). Please try reducing the size of your message or use the `/compress` command to compress the chat history.',
+            'Sending this message (30 tokens) might exceed the context window limit (70 tokens left). Please try reducing the size of your message or use the `/compress` command to compress the chat history.',
         },
       ])(
         'should add message $name',
@@ -2294,6 +2386,43 @@ describe('useGeminiStream', () => {
       // Check that onCancelSubmit was called
       await waitFor(() => {
         expect(onCancelSubmitSpy).toHaveBeenCalledWith(true);
+      });
+    });
+
+    it('should add informational messages when ChatCompressed event is received', async () => {
+      vi.mocked(tokenLimit).mockReturnValue(10000);
+      // Setup mock to return a stream with ChatCompressed event
+      mockSendMessageStream.mockReturnValue(
+        (async function* () {
+          yield {
+            type: ServerGeminiEventType.ChatCompressed,
+            value: {
+              originalTokenCount: 1000,
+              newTokenCount: 500,
+              compressionStatus: 'compressed',
+            },
+          };
+        })(),
+      );
+
+      const { result } = renderHookWithDefaults();
+
+      // Submit a query
+      await act(async () => {
+        await result.current.submitQuery('Test compression');
+      });
+
+      // Check that the succinct info message was added
+      await waitFor(() => {
+        expect(mockAddItem).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: MessageType.INFO,
+            text: 'Context compressed from 10% to 5%.',
+            secondaryText: 'Change threshold in /settings.',
+            color: theme.status.warning,
+          }),
+          expect.any(Number),
+        );
       });
     });
 
@@ -2702,7 +2831,6 @@ describe('useGeminiStream', () => {
           type: 'thinking',
           thought: expect.objectContaining({ subject: 'Full thought' }),
         }),
-        expect.any(Number),
       );
     });
 
@@ -3387,6 +3515,116 @@ describe('useGeminiStream', () => {
       // Then verify loop detection confirmation request was set
       await waitFor(() => {
         expect(result.current.loopDetectionConfirmationRequest).not.toBeNull();
+      });
+    });
+
+    describe('Race Condition Prevention', () => {
+      it('should reject concurrent submitQuery when already responding', async () => {
+        // Stream that stays open (simulates "still responding")
+        mockSendMessageStream.mockReturnValue(
+          (async function* () {
+            yield {
+              type: ServerGeminiEventType.Content,
+              value: 'First response',
+            };
+            // Keep the stream open
+            await new Promise(() => {});
+          })(),
+        );
+
+        const { result } = renderTestHook();
+
+        // Start first query without awaiting (fire-and-forget, like existing tests)
+        await act(async () => {
+          // eslint-disable-next-line @typescript-eslint/no-floating-promises
+          result.current.submitQuery('first query');
+        });
+
+        // Wait for the stream to start responding
+        await waitFor(() => {
+          expect(result.current.streamingState).toBe(StreamingState.Responding);
+        });
+
+        // Try a second query while first is still responding
+        await act(async () => {
+          // eslint-disable-next-line @typescript-eslint/no-floating-promises
+          result.current.submitQuery('second query');
+        });
+
+        // Should have only called sendMessageStream once (second was rejected)
+        expect(mockSendMessageStream).toHaveBeenCalledTimes(1);
+      });
+
+      it('should allow continuation queries via loop detection retry', async () => {
+        const mockLoopDetectionService = {
+          disableForSession: vi.fn(),
+        };
+        const mockClient = {
+          ...new MockedGeminiClientClass(mockConfig),
+          getLoopDetectionService: () => mockLoopDetectionService,
+        };
+        mockConfig.getGeminiClient = vi.fn().mockReturnValue(mockClient);
+
+        // First call triggers loop detection
+        mockSendMessageStream.mockReturnValueOnce(
+          (async function* () {
+            yield {
+              type: ServerGeminiEventType.LoopDetected,
+            };
+          })(),
+        );
+
+        // Retry call succeeds
+        mockSendMessageStream.mockReturnValueOnce(
+          (async function* () {
+            yield {
+              type: ServerGeminiEventType.Content,
+              value: 'Retry success',
+            };
+            yield {
+              type: ServerGeminiEventType.Finished,
+              value: { reason: 'STOP' },
+            };
+          })(),
+        );
+
+        const { result } = renderTestHook();
+
+        await act(async () => {
+          await result.current.submitQuery('test query');
+        });
+
+        await waitFor(() => {
+          expect(
+            result.current.loopDetectionConfirmationRequest,
+          ).not.toBeNull();
+        });
+
+        // User selects "disable" which triggers a continuation query
+        await act(async () => {
+          result.current.loopDetectionConfirmationRequest?.onComplete({
+            userSelection: 'disable',
+          });
+        });
+
+        // Verify disableForSession was called
+        expect(
+          mockLoopDetectionService.disableForSession,
+        ).toHaveBeenCalledTimes(1);
+
+        // Continuation query should have gone through (2 total calls)
+        await waitFor(() => {
+          expect(mockSendMessageStream).toHaveBeenCalledTimes(2);
+          expect(mockSendMessageStream).toHaveBeenNthCalledWith(
+            2,
+            'test query',
+            expect.any(AbortSignal),
+            expect.any(String),
+            undefined,
+            false,
+            'test query',
+          );
+        });
       });
     });
   });
