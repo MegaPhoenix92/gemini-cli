@@ -144,7 +144,7 @@ npm test -w @google/gemini-cli-core -- src/path/to/file.test.ts
 GEMINI_API_KEY=AIzaSy...BwM  # Dev key (separate quota)
 
 # Global gemini uses
-GEMINI_API_KEY=AIzaSy...2StM  # Production key
+GEMINI_API_KEY=AIzaSy...ZouU  # Production key (rotated 2026-03-10)
 ```
 
 ## Common Tasks

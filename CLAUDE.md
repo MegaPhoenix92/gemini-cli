@@ -90,7 +90,7 @@ Two separate API keys for isolated rate limits:
 
 | Command              | Key       | Purpose             | Quota  |
 | -------------------- | --------- | ------------------- | ------ |
-| `gemini` (global)    | `...2StM` | Stable CLI usage    | Tier 1 |
+| `gemini` (global)    | `...ZouU` | Stable CLI usage    | Tier 3 |
 | `gemini-dev` (local) | `...BwM`  | Development/testing | Tier 1 |
 
 Both keys are from Google AI Studio, associated with `trozlanio-firebase`
